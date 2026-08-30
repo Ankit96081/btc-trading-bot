@@ -1,5 +1,5 @@
-"""Reserved for future provider-specific adapters.
+"""Provider-specific market-data adapters."""
 
-Adapters in this package will implement ``src.data.interfaces.MarketDataProvider``
-and translate provider payloads into the normalized data models.
-"""
+from .binance_spot import BinanceSpotMarketDataProvider
+
+__all__ = ["BinanceSpotMarketDataProvider"]
