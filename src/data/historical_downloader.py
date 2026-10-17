@@ -12,26 +12,22 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import InvalidOperation
 from pathlib import Path
 
+from .csv_format import (
+    CANDLE_CSV_COLUMNS,
+    CandleCsvError,
+    candle_to_csv_row,
+    csv_row_to_candle,
+)
+from .csv_format import format_utc_timestamp as _format_timestamp
 from .interfaces import MarketDataProvider
 from .models import CandleRequest, OHLCVCandle
 from .validation import CandleValidationError, validate_candle
 
 _ONE_MINUTE = timedelta(minutes=1)
 _ONE_MILLISECOND = timedelta(milliseconds=1)
-_CSV_COLUMNS = (
-    "timestamp",
-    "symbol",
-    "timeframe",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "close_timestamp",
-)
 
 
 class HistoricalDataDownloadError(RuntimeError):
@@ -286,7 +282,7 @@ def _validate_candle_for_download(
 def _create_staged_csv(partial_path: Path) -> None:
     try:
         with partial_path.open("x", newline="", encoding="utf-8") as file_handle:
-            csv.DictWriter(file_handle, fieldnames=_CSV_COLUMNS).writeheader()
+            csv.DictWriter(file_handle, fieldnames=CANDLE_CSV_COLUMNS).writeheader()
             file_handle.flush()
             os.fsync(file_handle.fileno())
     except OSError as error:
@@ -298,9 +294,9 @@ def _create_staged_csv(partial_path: Path) -> None:
 def _append_candles(partial_path: Path, candles: Sequence[OHLCVCandle]) -> None:
     try:
         with partial_path.open("a", newline="", encoding="utf-8") as file_handle:
-            writer = csv.DictWriter(file_handle, fieldnames=_CSV_COLUMNS)
+            writer = csv.DictWriter(file_handle, fieldnames=CANDLE_CSV_COLUMNS)
             for candle in candles:
-                writer.writerow(_candle_to_row(candle))
+                writer.writerow(candle_to_csv_row(candle))
             file_handle.flush()
             os.fsync(file_handle.fileno())
     except OSError as error:
@@ -323,13 +319,14 @@ def _inspect_staged_csv(
     try:
         with partial_path.open(newline="", encoding="utf-8") as file_handle:
             reader = csv.DictReader(file_handle)
-            if tuple(reader.fieldnames or ()) != _CSV_COLUMNS:
+            if tuple(reader.fieldnames or ()) != CANDLE_CSV_COLUMNS:
                 raise HistoricalDataIntegrityError("staged CSV has an unexpected schema")
 
             for row in reader:
-                if None in row or any(value is None for value in row.values()):
-                    raise HistoricalDataIntegrityError("staged CSV contains a malformed row")
-                candle = _row_to_candle(row)
+                try:
+                    candle = csv_row_to_candle(row)
+                except CandleCsvError as error:
+                    raise HistoricalDataIntegrityError(f"staged {error}") from error
                 _validate_candle_for_download(
                     candle,
                     expected_open_time=expected_open_time,
@@ -347,69 +344,6 @@ def _inspect_staged_csv(
         ) from error
 
     return _DownloadProgress(candle_count=candle_count, next_open_time=expected_open_time)
-
-
-def _candle_to_row(candle: OHLCVCandle) -> dict[str, str]:
-    return {
-        "timestamp": _format_timestamp(candle.open_time),
-        "symbol": candle.symbol,
-        "timeframe": candle.timeframe,
-        "open": str(candle.open),
-        "high": str(candle.high),
-        "low": str(candle.low),
-        "close": str(candle.close),
-        "volume": str(candle.volume),
-        "close_timestamp": _format_timestamp(candle.close_time),
-    }
-
-
-def _row_to_candle(row: dict[str | None, str | None]) -> OHLCVCandle:
-    return OHLCVCandle(
-        symbol=_required_csv_value(row, "symbol"),
-        timeframe=_required_csv_value(row, "timeframe"),
-        open_time=_parse_timestamp(_required_csv_value(row, "timestamp")),
-        close_time=_parse_timestamp(_required_csv_value(row, "close_timestamp")),
-        open=_parse_decimal(row, "open"),
-        high=_parse_decimal(row, "high"),
-        low=_parse_decimal(row, "low"),
-        close=_parse_decimal(row, "close"),
-        volume=_parse_decimal(row, "volume"),
-    )
-
-
-def _required_csv_value(row: dict[str | None, str | None], field_name: str) -> str:
-    value = row.get(field_name)
-    if value is None:
-        raise HistoricalDataIntegrityError(f"staged CSV has no {field_name} value")
-    return value
-
-
-def _parse_decimal(row: dict[str | None, str | None], field_name: str) -> Decimal:
-    try:
-        value = Decimal(_required_csv_value(row, field_name))
-    except InvalidOperation as error:
-        raise HistoricalDataIntegrityError(
-            f"staged CSV has an invalid {field_name} value"
-        ) from error
-    if not value.is_finite():
-        raise HistoricalDataIntegrityError(f"staged CSV has a non-finite {field_name} value")
-    return value
-
-
-def _parse_timestamp(value: str) -> datetime:
-    if not value.endswith("Z"):
-        raise HistoricalDataIntegrityError("staged CSV timestamps must be UTC and end with Z")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as error:
-        raise HistoricalDataIntegrityError("staged CSV has an invalid timestamp") from error
-
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise HistoricalDataIntegrityError("staged CSV timestamps must be UTC")
-    normalized = parsed.astimezone(UTC)
-    if _format_timestamp(normalized) != value:
-        raise HistoricalDataIntegrityError("staged CSV timestamps use an inconsistent format")
-    return normalized
 
 
 def _validate_non_empty_text(field_name: str, value: str) -> str:
@@ -432,10 +366,6 @@ def _validate_boundary(field_name: str, value: datetime) -> datetime:
     if normalized.second != 0 or normalized.microsecond != 0:
         raise ValueError(f"{field_name} must be aligned to a one-minute boundary")
     return normalized
-
-
-def _format_timestamp(value: datetime) -> str:
-    return value.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _partial_path(target_path: Path) -> Path:
