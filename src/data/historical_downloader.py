@@ -9,7 +9,7 @@ can be safely resumed by a later invocation with the same request.
 
 import csv
 import os
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import InvalidOperation
@@ -28,6 +28,9 @@ from .validation import CandleValidationError, validate_candle
 
 _ONE_MINUTE = timedelta(minutes=1)
 _ONE_MILLISECOND = timedelta(milliseconds=1)
+
+KnownGap = tuple[datetime, datetime]
+"""A ``[start, end)`` UTC interval in which the exchange published no candles."""
 
 
 class HistoricalDataDownloadError(RuntimeError):
@@ -66,9 +69,20 @@ class HistoricalDataDownloader:
     this first downloader to ``1m`` makes missing-timestamp detection exact and
     keeps the implementation aligned with the project's current BTC/USDT
     research scope.
+
+    Every minute must be present, except inside ``known_gaps``: documented
+    exchange outages with no candles at all.  Missing candles are accepted only
+    when the whole missing run lies inside one known gap; they are skipped,
+    never filled in.
     """
 
-    def __init__(self, provider: MarketDataProvider, *, batch_size: int = 1_000) -> None:
+    def __init__(
+        self,
+        provider: MarketDataProvider,
+        *,
+        batch_size: int = 1_000,
+        known_gaps: Iterable[KnownGap] = (),
+    ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int):
             raise TypeError("batch_size must be an integer")
         if batch_size <= 0:
@@ -76,6 +90,7 @@ class HistoricalDataDownloader:
 
         self._provider = provider
         self._batch_size = batch_size
+        self._known_gaps = _validate_known_gaps(known_gaps)
 
     def download(
         self,
@@ -116,7 +131,10 @@ class HistoricalDataDownloader:
         provider_end_time = normalized_end - _ONE_MILLISECOND
         next_open_time = progress.next_open_time
 
-        while next_open_time < normalized_end:
+        while True:
+            next_open_time = _skip_known_gap(next_open_time, normalized_end, self._known_gaps)
+            if next_open_time >= normalized_end:
+                break
             request = CandleRequest(
                 symbol=normalized_symbol,
                 timeframe=normalized_timeframe,
@@ -132,6 +150,7 @@ class HistoricalDataDownloader:
                 symbol=normalized_symbol,
                 timeframe=normalized_timeframe,
                 batch_size=self._batch_size,
+                known_gaps=self._known_gaps,
             )
             _append_candles(partial_path, candles)
 
@@ -141,6 +160,7 @@ class HistoricalDataDownloader:
             timeframe=normalized_timeframe,
             start_time=normalized_start,
             end_time=normalized_end,
+            known_gaps=self._known_gaps,
         )
         if completed_progress.next_open_time != normalized_end:
             raise HistoricalDataIntegrityError(
@@ -204,6 +224,7 @@ class HistoricalDataDownloader:
                     timeframe=timeframe,
                     start_time=start_time,
                     end_time=end_time,
+                    known_gaps=self._known_gaps,
                 ),
                 True,
             )
@@ -220,6 +241,7 @@ def _validate_provider_batch(
     symbol: str,
     timeframe: str,
     batch_size: int,
+    known_gaps: Sequence[KnownGap],
 ) -> datetime:
     if not isinstance(candles, Sequence):
         raise HistoricalDataIntegrityError("provider returned a non-sequence candle batch")
@@ -234,14 +256,15 @@ def _validate_provider_batch(
     for candle in candles:
         if not isinstance(candle, OHLCVCandle):
             raise HistoricalDataIntegrityError("provider returned a non-OHLCVCandle value")
-        _validate_candle_for_download(
+        open_time = _validate_candle_for_download(
             candle,
             expected_open_time=next_open_time,
             end_time=end_time,
             symbol=symbol,
             timeframe=timeframe,
+            known_gaps=known_gaps,
         )
-        next_open_time += _ONE_MINUTE
+        next_open_time = open_time + _ONE_MINUTE
 
     return next_open_time
 
@@ -253,7 +276,14 @@ def _validate_candle_for_download(
     end_time: datetime,
     symbol: str,
     timeframe: str,
-) -> None:
+    known_gaps: Sequence[KnownGap],
+) -> datetime:
+    """Validate one candle and return its UTC open time.
+
+    The open time must be ``expected_open_time``, or later only when every
+    skipped minute lies inside one known gap.
+    """
+
     try:
         validate_candle(candle)
     except CandleValidationError as error:
@@ -273,10 +303,13 @@ def _validate_candle_for_download(
         raise HistoricalDataIntegrityError(
             f"duplicate or out-of-order timestamp {_format_timestamp(open_time)}"
         )
-    if open_time > expected_open_time:
+    if open_time > expected_open_time and not _within_known_gap(
+        expected_open_time, open_time, known_gaps
+    ):
         raise HistoricalDataIntegrityError(
             f"missing candle timestamp {_format_timestamp(expected_open_time)}"
         )
+    return open_time
 
 
 def _create_staged_csv(partial_path: Path) -> None:
@@ -312,6 +345,7 @@ def _inspect_staged_csv(
     timeframe: str,
     start_time: datetime,
     end_time: datetime,
+    known_gaps: Sequence[KnownGap],
 ) -> _DownloadProgress:
     expected_open_time = start_time
     candle_count = 0
@@ -327,14 +361,15 @@ def _inspect_staged_csv(
                     candle = csv_row_to_candle(row)
                 except CandleCsvError as error:
                     raise HistoricalDataIntegrityError(f"staged {error}") from error
-                _validate_candle_for_download(
+                open_time = _validate_candle_for_download(
                     candle,
                     expected_open_time=expected_open_time,
                     end_time=end_time,
                     symbol=symbol,
                     timeframe=timeframe,
+                    known_gaps=known_gaps,
                 )
-                expected_open_time += _ONE_MINUTE
+                expected_open_time = open_time + _ONE_MINUTE
                 candle_count += 1
     except HistoricalDataIntegrityError:
         raise
@@ -343,7 +378,38 @@ def _inspect_staged_csv(
             f"Unable to validate staged historical data at {partial_path}"
         ) from error
 
-    return _DownloadProgress(candle_count=candle_count, next_open_time=expected_open_time)
+    next_open_time = _skip_known_gap(expected_open_time, end_time, known_gaps)
+    return _DownloadProgress(candle_count=candle_count, next_open_time=next_open_time)
+
+
+def _validate_known_gaps(known_gaps: Iterable[KnownGap]) -> tuple[KnownGap, ...]:
+    gaps = []
+    for start, end in known_gaps:
+        start = _validate_boundary("known gap start", start)
+        end = _validate_boundary("known gap end", end)
+        if start >= end:
+            raise ValueError("known gap start must be earlier than its end")
+        gaps.append((start, end))
+    return tuple(sorted(gaps))
+
+
+def _within_known_gap(
+    first_missing: datetime, next_present: datetime, known_gaps: Sequence[KnownGap]
+) -> bool:
+    """Whether every minute in ``[first_missing, next_present)`` lies inside one known gap."""
+
+    return any(start <= first_missing and next_present <= end for start, end in known_gaps)
+
+
+def _skip_known_gap(
+    open_time: datetime, end_time: datetime, known_gaps: Sequence[KnownGap]
+) -> datetime:
+    """Move ``open_time`` past a known gap it falls inside, capped at ``end_time``."""
+
+    for start, end in known_gaps:
+        if start <= open_time < end:
+            return min(end, end_time)
+    return open_time
 
 
 def _validate_non_empty_text(field_name: str, value: str) -> str:

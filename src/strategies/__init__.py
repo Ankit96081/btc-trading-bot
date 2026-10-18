@@ -8,6 +8,7 @@ from .registry import (
     strategy_factory,
     strategy_parameters,
 )
+from .trend import MultiTimeframeTrend, TrendFilter
 
 __all__ = [
     "FLAT",
@@ -16,9 +17,11 @@ __all__ = [
     "BuyAndHold",
     "DonchianBreakout",
     "MovingAverageCrossover",
+    "MultiTimeframeTrend",
     "Strategy",
     "StrategyConfigurationError",
     "StrategyFactory",
+    "TrendFilter",
     "strategy_factory",
     "strategy_parameters",
 ]

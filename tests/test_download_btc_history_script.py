@@ -113,7 +113,9 @@ def test_main_uses_provider_and_downloader_without_a_network_call(
 
     assert exit_code == 0
     provider_factory.assert_called_once_with()
-    downloader_factory.assert_called_once_with(provider)
+    downloader_factory.assert_called_once_with(
+        provider, known_gaps=download_btc_history.BINANCE_SPOT_KNOWN_GAPS
+    )
     downloader.download.assert_called_once_with(
         symbol="BTC/USDT",
         timeframe="1m",

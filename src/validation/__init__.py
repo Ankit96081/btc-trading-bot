@@ -7,15 +7,18 @@ from .criteria import (
     ValidationEvidence,
 )
 from .walk_forward import (
+    RISK_PARAMETERS,
     FoldResult,
     WalkForwardConfig,
     WalkForwardResult,
     expand_grid,
     fold_parameters,
     run_walk_forward,
+    split_parameters,
 )
 
 __all__ = [
+    "RISK_PARAMETERS",
     "CriterionResult",
     "FoldResult",
     "HoldoutCriteria",
@@ -26,4 +29,5 @@ __all__ = [
     "expand_grid",
     "fold_parameters",
     "run_walk_forward",
+    "split_parameters",
 ]

@@ -15,7 +15,7 @@ trading are for testing the software only.
 ## Objectives
 
 - Historical BTC market data ✅
-- Strategy research 🔄 (baseline strategies only so far)
+- Strategy research 🔄 (baselines and trend filters; none validated yet)
 - Backtesting ✅
 - Walk-forward validation ✅
 - Paper trading ✅ (software built; waiting for a validated strategy)
@@ -49,7 +49,8 @@ No real funds should be used until the strategy and software pass predefined val
 ```bash
 pip install pytest ruff   # dev tools; the project has no runtime dependencies
 
-# 1. Download 1m history (resumable; one file per month works well)
+# 1. Download 1m history (resumable, retries transient errors, skips Binance's
+#    known 2023-03-24 outage; one file per month works well)
 python scripts/download_btc_history.py --start 2024-01-01T00:00:00Z \
     --end 2024-02-01T00:00:00Z --output data/raw/btcusdt_1m_2024-01.csv
 
@@ -64,6 +65,7 @@ python scripts/run_backtest.py --strategy donchian_breakout \
 python scripts/walk_forward.py --strategy donchian_breakout \
     --grid entry_period=24,48,96,168 --grid exit_period=12,24,48 \
     --vol-target 0.4 --stop-atr 3 --max-drawdown 0.25 --max-daily-loss 0.05
+#    Risk settings can be tuned per fold too: --grid risk.vol_target=0.3,0.5,0.8
 
 # 5. Paper trade on live public Binance data (no keys; resumable; touch data/paper/KILL to halt)
 python scripts/paper_trade.py --strategy donchian_breakout --param entry_period=48 ...
@@ -82,7 +84,7 @@ ruff check . --no-cache
 | Path | Purpose |
 |------|---------|
 | `src/data/` | Candle models, validation, Binance public data provider, resumable downloader, CSV format, dataset loader, resampler |
-| `src/strategies/` | `Strategy` protocol (target exposure from closed bars), indicators, baseline strategies, registry |
+| `src/strategies/` | `Strategy` protocol (target exposure from closed bars), indicators, baseline and trend strategies, registry |
 | `src/risk/` | `RiskManager`: exposure cap, volatility targeting, stops, daily loss limit, drawdown kill switch, trade cap |
 | `src/execution/` | Orders/fills, cost model, `Broker` protocol, `SimulatedBroker`, testnet client and broker |
 | `src/core/` | `TradingEngine` (the one bar-by-bar loop every mode uses), `Portfolio`, heartbeat, logging |
@@ -90,11 +92,11 @@ ruff check . --no-cache
 | `src/validation/` | Walk-forward optimization and the predefined pass/fail criteria |
 | `src/paper/` | Closed-bar live feed, `LiveTrader` (paper and testnet), exchange reconciliation |
 | `src/database/` | SQLite storage for live runs (bars, fills, equity, state, events) |
-| `docs/` | Validation criteria and the go-live checklist |
+| `docs/` | Validation criteria, research log, and the go-live checklist |
 
 ## Research status
 
-Data: BTC/USDT 1m, 2022-01 to 2026-08. The only gap is Binance's 2023-03-24
+Data: BTC/USDT 1m, 2022-01 to 2026-09. The only gap is Binance's 2023-03-24
 12:40–14:00 UTC outage; bars touching it are dropped, not filled in.
 
 Walk-forward on 1h bars, with out-of-sample windows from 2023-01 to 2025-12
@@ -107,9 +109,15 @@ Walk-forward on 1h bars, with out-of-sample windows from 2023-01 to 2025-12
 | MA crossover + risk limits | +19% | 0.38 | 27.9% | 5/9 | FAIL |
 | Donchian breakout | +30% | 0.45 | 35.6% | 4/9 | FAIL |
 | Donchian breakout + risk limits | +65% | 0.98 | 18.4% | 7/9 | FAIL |
+| Trend filter (daily SMA), no ATR stop | +160% | 1.06 | 40.4% | 5/9 | FAIL |
+| Trend filter, tuned vol target, no ATR stop | +128% | 1.05 | 26.7% | 5/9 | FAIL |
 
 "Risk limits" means `--vol-target 0.4 --stop-atr 3 --max-drawdown 0.25 --max-daily-loss 0.05`.
 The best candidate roughly halves buy-and-hold's drawdown. It still falls short
 of buy-and-hold's risk-adjusted return, and it has 58% profitable folds against
 the 60% required. The criteria are fixed in advance and will not be loosened
 to make a strategy pass.
+
+Every run, including the multi-timeframe and volatility-sizing experiments
+that did worse, is recorded in [docs/research_log.md](docs/research_log.md)
+(12 variants so far).

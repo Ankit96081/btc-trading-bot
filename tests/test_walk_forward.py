@@ -10,7 +10,8 @@ import pytest
 from src.backtest import run_backtest
 from src.data.models import OHLCVCandle
 from src.execution import CostModel, OrderReason
-from src.strategies import BuyAndHold
+from src.risk import RiskConfig
+from src.strategies import BuyAndHold, StrategyConfigurationError
 from src.validation import (
     HoldoutCriteria,
     ValidationCriteria,
@@ -19,6 +20,7 @@ from src.validation import (
     expand_grid,
     fold_parameters,
     run_walk_forward,
+    split_parameters,
 )
 from src.validation.walk_forward import _fold_windows
 from tests.factories import bars_from_closes
@@ -157,3 +159,46 @@ def test_criteria_report_each_check() -> None:
     ]
     holdout = HoldoutCriteria().evaluate(evidence.out_of_sample)
     assert [result.name for result in holdout] == ["Holdout total return", "Holdout max drawdown"]
+
+
+def test_split_parameters_applies_risk_entries_to_the_risk_config() -> None:
+    strategy_parameters, risk_config = split_parameters(
+        {"fast_period": "5", "risk.vol_target": "0.3", "risk.vol_lookback": "48"},
+        RiskConfig(stop_loss_atr_multiple=3.0),
+    )
+
+    assert strategy_parameters == {"fast_period": "5"}
+    assert risk_config == RiskConfig(
+        stop_loss_atr_multiple=3.0, volatility_target=0.3, volatility_lookback=48
+    )
+
+
+def test_split_parameters_keeps_the_risk_config_without_risk_entries() -> None:
+    config = RiskConfig(max_drawdown=Decimal("0.2"))
+    assert split_parameters({"fast_period": 5}, config) == ({"fast_period": 5}, config)
+
+
+@pytest.mark.parametrize(
+    ("parameters", "message"),
+    [({"risk.leverage": "2"}, "unknown risk parameter"), ({"risk.vol_target": "x"}, "invalid")],
+)
+def test_split_parameters_rejects_bad_risk_entries(
+    parameters: dict[str, object], message: str
+) -> None:
+    with pytest.raises(StrategyConfigurationError, match=message):
+        split_parameters(parameters, None)
+
+
+def test_walk_forward_grid_can_tune_risk_settings() -> None:
+    bars = trending_market()
+    grid = {"fast_period": [5], "slow_period": [30]}
+    # Volatility targeting waits for its lookback, so train windows trade less.
+    config = replace(CONFIG, min_train_round_trips=1)
+
+    tuned = run_walk_forward(bars, "ma_crossover", {**grid, "risk.vol_target": [0.2]}, config)
+    fixed = run_walk_forward(
+        bars, "ma_crossover", grid, config, risk_config=RiskConfig(volatility_target=0.2)
+    )
+
+    assert tuned.folds[0].parameters["risk.vol_target"] == 0.2
+    assert tuned.out_of_sample == fixed.out_of_sample

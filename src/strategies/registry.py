@@ -6,11 +6,14 @@ from functools import partial
 
 from .base import Strategy, StrategyFactory
 from .baselines import BuyAndHold, DonchianBreakout, MovingAverageCrossover
+from .trend import MultiTimeframeTrend, TrendFilter
 
 STRATEGIES: dict[str, type[Strategy]] = {
     "buy_and_hold": BuyAndHold,
     "ma_crossover": MovingAverageCrossover,
     "donchian_breakout": DonchianBreakout,
+    "trend_filter": TrendFilter,
+    "multi_timeframe_trend": MultiTimeframeTrend,
 }
 
 

@@ -271,3 +271,100 @@ def test_failed_atomic_publish_leaves_only_resumable_staged_data(
     assert resuming_provider.requests == []
     assert output_path.exists()
     assert not partial_path.exists()
+
+
+def _gap(first_index: int, end_index: int) -> tuple[datetime, datetime]:
+    return (_START + timedelta(minutes=first_index), _START + timedelta(minutes=end_index))
+
+
+def test_download_skips_a_known_exchange_gap(tmp_path: Path) -> None:
+    output_path = tmp_path / "data" / "raw" / "btc_usdt_1m.csv"
+    provider = FakeMarketDataProvider([make_candle(index) for index in (0, 1, 4, 5)])
+
+    result = HistoricalDataDownloader(provider, known_gaps=[_gap(2, 4)]).download(
+        symbol="BTC/USDT",
+        timeframe="1m",
+        start_time=_START,
+        end_time=_START + timedelta(minutes=6),
+        output_path=output_path,
+    )
+
+    assert result.candle_count == 4
+    timestamps = [row["timestamp"] for row in read_csv_rows(output_path)]
+    assert timestamps == [
+        "2026-08-30T09:00:00.000Z",
+        "2026-08-30T09:01:00.000Z",
+        "2026-08-30T09:04:00.000Z",
+        "2026-08-30T09:05:00.000Z",
+    ]
+
+
+def test_download_rejects_missing_candles_outside_a_known_gap(tmp_path: Path) -> None:
+    provider = FakeMarketDataProvider([make_candle(index) for index in (0, 4, 5)])
+
+    with pytest.raises(HistoricalDataIntegrityError, match="missing candle timestamp 2026-08-30T09:01"):
+        HistoricalDataDownloader(provider, known_gaps=[_gap(2, 4)]).download(
+            symbol="BTC/USDT",
+            timeframe="1m",
+            start_time=_START,
+            end_time=_START + timedelta(minutes=6),
+            output_path=tmp_path / "data" / "raw" / "btc_usdt_1m.csv",
+        )
+
+
+@pytest.mark.parametrize(
+    ("present", "gap", "end_index"),
+    [((2, 3), (0, 2), 4), ((0, 1), (2, 4), 4), ((0, 1), (2, 9), 4)],
+    ids=["gap-at-start", "gap-at-end", "gap-beyond-end"],
+)
+def test_download_handles_known_gaps_at_the_range_edges(
+    tmp_path: Path, present: tuple[int, ...], gap: tuple[int, int], end_index: int
+) -> None:
+    provider = FakeMarketDataProvider([make_candle(index) for index in present])
+
+    result = HistoricalDataDownloader(provider, known_gaps=[_gap(*gap)]).download(
+        symbol="BTC/USDT",
+        timeframe="1m",
+        start_time=_START,
+        end_time=_START + timedelta(minutes=end_index),
+        output_path=tmp_path / "data" / "raw" / "btc_usdt_1m.csv",
+    )
+
+    assert result.candle_count == len(present)
+
+
+def test_download_resumes_after_a_known_gap(tmp_path: Path) -> None:
+    output_path = tmp_path / "data" / "raw" / "btc_usdt_1m.csv"
+    candles = [make_candle(index) for index in (0, 1, 4, 5, 6)]
+    known_gaps = [_gap(2, 4)]
+
+    with pytest.raises(RuntimeError, match="simulated provider interruption"):
+        HistoricalDataDownloader(
+            FakeMarketDataProvider(candles, fail_on_call=2), batch_size=2, known_gaps=known_gaps
+        ).download(
+            symbol="BTC/USDT",
+            timeframe="1m",
+            start_time=_START,
+            end_time=_START + timedelta(minutes=7),
+            output_path=output_path,
+        )
+
+    resumed_provider = FakeMarketDataProvider(candles)
+    result = HistoricalDataDownloader(
+        resumed_provider, batch_size=2, known_gaps=known_gaps
+    ).download(
+        symbol="BTC/USDT",
+        timeframe="1m",
+        start_time=_START,
+        end_time=_START + timedelta(minutes=7),
+        output_path=output_path,
+    )
+
+    assert result.resumed
+    assert result.candle_count == 5
+    assert resumed_provider.requests[0].start_time == _START + timedelta(minutes=4)
+
+
+def test_downloader_rejects_an_empty_known_gap() -> None:
+    with pytest.raises(ValueError, match="known gap"):
+        HistoricalDataDownloader(FakeMarketDataProvider([]), known_gaps=[_gap(2, 2)])

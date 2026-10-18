@@ -4,6 +4,10 @@ Example:
     python scripts/walk_forward.py --strategy ma_crossover \
         --grid fast_period=12,24,48 --grid slow_period=96,168,336 --stop-atr 3
 
+Grid or --param names starting with "risk." tune risk settings per fold, e.g.
+    --grid risk.vol_target=0.3,0.4,0.6
+(choices: risk.vol_target, risk.vol_lookback, risk.stop_atr).
+
 Data from --holdout-start onwards is excluded from tuning.  Evaluate it with
 --evaluate-holdout only once a strategy passes every criterion; see
 docs/validation_criteria.md.
@@ -46,8 +50,10 @@ from src.validation import (
     ValidationEvidence,
     WalkForwardConfig,
     WalkForwardResult,
+    expand_grid,
     fold_parameters,
     run_walk_forward,
+    split_parameters,
 )
 
 DEFAULT_DATA = "data/processed/btcusdt_1h.csv"
@@ -98,7 +104,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if overlap:
             raise ValueError(f"parameters given both as --param and --grid: {sorted(overlap)}")
         grid.update({name: [value] for name, value in fixed.items()})
-        strategy_factory(args.strategy)  # Fail fast on an unknown strategy name.
+        for parameters in expand_grid(grid)[:1]:  # Fail fast on unknown names.
+            strategy_parameters, _ = split_parameters(parameters, None)
+            strategy_factory(args.strategy, strategy_parameters)
 
         all_bars = load_bars(resolve_paths(args.data, PROJECT_ROOT), args.start, args.end)
         research = [bar for bar in all_bars if bar.open_time < args.holdout_start]
@@ -188,12 +196,13 @@ def _evaluate_holdout(args, research, holdout, parameters, common, cost_model):
         print("\nHoldout: not enough data.")
         return []
     warmup = research[-args.warmup_bars:] if args.warmup_bars else []
+    strategy_parameters, risk_config = split_parameters(parameters, common["risk_config"])
     holdout_result = run_backtest(
         [*warmup, *holdout],
-        strategy_factory(args.strategy, parameters),
+        strategy_factory(args.strategy, strategy_parameters),
         cost_model=cost_model,
         warmup_bars=len(warmup),
-        **common,
+        **{**common, "risk_config": risk_config},
     )
     print(f"\nHoldout ({holdout[0].open_time:%Y-%m-%d}..{holdout[-1].open_time:%Y-%m-%d}) "
           f"with final parameters {parameters}:")

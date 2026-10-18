@@ -26,6 +26,7 @@ from src.data.historical_downloader import (
     HistoricalDataDownloadError,
 )
 from src.data.providers.binance_spot import (
+    BINANCE_SPOT_KNOWN_GAPS,
     BinanceMarketDataError,
     BinanceSpotMarketDataProvider,
 )
@@ -88,7 +89,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     try:
         provider = BinanceSpotMarketDataProvider()
-        downloader = HistoricalDataDownloader(provider)
+        downloader = HistoricalDataDownloader(provider, known_gaps=BINANCE_SPOT_KNOWN_GAPS)
         result = downloader.download(
             symbol=_SYMBOL,
             timeframe=_TIMEFRAME,

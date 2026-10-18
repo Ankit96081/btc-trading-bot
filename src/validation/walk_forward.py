@@ -3,8 +3,8 @@
 import itertools
 import math
 import statistics
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from src.backtest.metrics import PerformanceMetrics, compute_metrics
@@ -17,6 +17,14 @@ from src.risk.manager import RiskConfig
 from src.strategies.registry import StrategyConfigurationError, strategy_factory
 
 ParameterSet = dict[str, object]
+
+RISK_PARAMETER_PREFIX = "risk."
+RISK_PARAMETERS: dict[str, tuple[str, Callable[[object], object]]] = {
+    "risk.vol_target": ("volatility_target", float),
+    "risk.vol_lookback": ("volatility_lookback", int),
+    "risk.stop_atr": ("stop_loss_atr_multiple", float),
+}
+"""Risk settings a grid may tune alongside strategy parameters, e.g. ``risk.vol_target``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +87,32 @@ class WalkForwardResult:
         return self.folds[-1].parameters
 
 
+def split_parameters(
+    parameters: Mapping[str, object], risk_config: RiskConfig | None
+) -> tuple[ParameterSet, RiskConfig | None]:
+    """Separate ``risk.*`` entries from strategy parameters and apply them to ``risk_config``."""
+
+    strategy_parameters: ParameterSet = {}
+    overrides: dict[str, object] = {}
+    for name, value in parameters.items():
+        if not name.startswith(RISK_PARAMETER_PREFIX):
+            strategy_parameters[name] = value
+            continue
+        if name not in RISK_PARAMETERS:
+            known = ", ".join(RISK_PARAMETERS)
+            raise StrategyConfigurationError(
+                f"unknown risk parameter {name!r}; choose from {known}"
+            )
+        field, convert = RISK_PARAMETERS[name]
+        try:
+            overrides[field] = convert(value)
+        except (TypeError, ValueError) as error:
+            raise StrategyConfigurationError(f"invalid {name} value {value!r}") from error
+    if not overrides:
+        return strategy_parameters, risk_config
+    return strategy_parameters, replace(risk_config or RiskConfig(), **overrides)
+
+
 def expand_grid(grid: Mapping[str, Sequence[object]]) -> list[ParameterSet]:
     """Return every combination of the grid's values, in a deterministic order."""
 
@@ -103,7 +137,9 @@ def run_walk_forward(
     Each fold selects the parameter set with the best train-window Sharpe
     ratio and trades it on the following test window, starting with the
     previous fold's ending equity.  Positions are closed, with costs, at the
-    end of every test window so no fold inherits another's position.  Pass ``fixed_parameters`` (one set per
+    end of every test window so no fold inherits another's position.  Grid
+    entries named in :data:`RISK_PARAMETERS` tune ``risk_config`` per fold
+    instead of the strategy.  Pass ``fixed_parameters`` (one set per
     fold, for example from an earlier run) to skip selection; the cost stress
     test uses this to re-run the exact same choices under harsher costs.
     """
@@ -132,12 +168,13 @@ def run_walk_forward(
                 engine_config,
             )
         warmup_start = max(0, test_start - config.warmup_bars)
+        strategy_parameters, fold_risk_config = split_parameters(parameters, risk_config)
         test = run_backtest(
             bars[warmup_start:test_end],
-            strategy_factory(strategy, parameters),
+            strategy_factory(strategy, strategy_parameters),
             initial_cash=cash,
             cost_model=cost_model,
-            risk_config=risk_config,
+            risk_config=fold_risk_config,
             engine_config=engine_config,
             warmup_bars=test_start - warmup_start,
             liquidate_at_end=True,
@@ -187,14 +224,15 @@ def _select_parameters(
     scores: dict[int, float] = {}
     for position, parameters in enumerate(candidates):
         try:
-            factory = strategy_factory(strategy, parameters)
-        except StrategyConfigurationError:
+            strategy_parameters, candidate_risk_config = split_parameters(parameters, risk_config)
+            factory = strategy_factory(strategy, strategy_parameters)
+        except (StrategyConfigurationError, ValueError):
             continue
         result = run_backtest(
             train,
             factory,
             cost_model=cost_model,
-            risk_config=risk_config,
+            risk_config=candidate_risk_config,
             engine_config=engine_config,
         )
         if len(result.round_trips) < config.min_train_round_trips:

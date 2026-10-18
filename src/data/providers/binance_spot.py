@@ -5,6 +5,7 @@ It does not access account, order, futures, or other authenticated endpoints.
 """
 
 import json
+import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -21,6 +22,14 @@ BINANCE_SPOT_BASE_URL = "https://api.binance.com"
 MAX_KLINES_PER_REQUEST = 1_000
 _KLINES_PATH = "/api/v3/klines"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+BINANCE_SPOT_KNOWN_GAPS: tuple[tuple[datetime, datetime], ...] = (
+    # Spot trading outage on 2023-03-24; Binance published no 1m klines for
+    # 12:40-13:59 UTC.  Intervals are [start, end) in UTC.
+    (datetime(2023, 3, 24, 12, 40, tzinfo=UTC), datetime(2023, 3, 24, 14, 0, tzinfo=UTC)),
+)
+"""Intervals in which Binance Spot has no klines, so their absence is not a download error."""
 
 HttpTransport = Callable[[str, float], bytes]
 
@@ -34,7 +43,24 @@ class BinanceRequestError(BinanceMarketDataError):
 
 
 class BinanceHttpError(BinanceMarketDataError):
-    """Raised when Binance's public HTTP endpoint cannot be reached or succeeds poorly."""
+    """Raised when Binance's public HTTP endpoint cannot be reached or succeeds poorly.
+
+    ``status`` is the HTTP status code, or ``None`` when no response arrived
+    (connection failure or timeout).
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def transient(self) -> bool:
+        """Whether retrying the same request later may succeed.
+
+        HTTP 418 (IP ban) is deliberately not transient: retrying extends the ban.
+        """
+
+        return self.status is None or self.status in _TRANSIENT_HTTP_STATUSES
 
 
 class BinanceApiError(BinanceMarketDataError):
@@ -52,6 +78,10 @@ class BinanceSpotMarketDataProvider(MarketDataProvider):
     Requests above that limit are paginated. A request without ``limit`` retrieves
     at most one maximum-sized page; a full historical downloader is intentionally
     outside this adapter's scope.
+
+    Transient HTTP failures (timeouts, connection errors, HTTP 408/429/5xx) are
+    retried up to ``max_retries`` times, waiting ``retry_delay_seconds`` and
+    doubling the wait after each attempt.  Other failures are raised at once.
     """
 
     def __init__(
@@ -59,13 +89,22 @@ class BinanceSpotMarketDataProvider(MarketDataProvider):
         base_url: str = BINANCE_SPOT_BASE_URL,
         timeout_seconds: float = 10.0,
         transport: HttpTransport | None = None,
+        *,
+        max_retries: int = 4,
+        retry_delay_seconds: float = 1.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
+        if max_retries < 0 or retry_delay_seconds < 0:
+            raise ValueError("max_retries and retry_delay_seconds must not be negative")
 
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._transport = transport or _default_transport
+        self._max_retries = max_retries
+        self._retry_delay_seconds = retry_delay_seconds
+        self._sleep = sleep
 
     def get_candles(self, request: CandleRequest) -> Sequence[OHLCVCandle]:
         """Fetch, normalize, and validate candles for ``request``.
@@ -166,8 +205,20 @@ class BinanceSpotMarketDataProvider(MarketDataProvider):
             parameters["endTime"] = end_time_ms
 
         url = f"{self._base_url}{_KLINES_PATH}?{urlencode(parameters)}"
-        payload = _load_response(self._transport, url, self._timeout_seconds)
+        payload = self._load_with_retries(url)
         return _convert_klines(payload, request)
+
+    def _load_with_retries(self, url: str) -> Any:
+        delay = self._retry_delay_seconds
+        for attempt in range(self._max_retries + 1):
+            try:
+                return _load_response(self._transport, url, self._timeout_seconds)
+            except BinanceHttpError as error:
+                if not error.transient or attempt == self._max_retries:
+                    raise
+            self._sleep(delay)
+            delay *= 2
+        raise AssertionError("unreachable")
 
 
 def _default_transport(url: str, timeout_seconds: float) -> bytes:
@@ -176,10 +227,12 @@ def _default_transport(url: str, timeout_seconds: float) -> bytes:
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
             if response.status != 200:
-                raise BinanceHttpError(f"Binance returned HTTP {response.status}")
+                raise BinanceHttpError(
+                    f"Binance returned HTTP {response.status}", status=response.status
+                )
             return response.read()
     except HTTPError as error:
-        raise BinanceHttpError(f"Binance returned HTTP {error.code}") from error
+        raise BinanceHttpError(f"Binance returned HTTP {error.code}", status=error.code) from error
     except URLError as error:
         raise BinanceHttpError("Unable to reach Binance Spot public API") from error
     except TimeoutError as error:

@@ -95,11 +95,62 @@ def test_provider_raises_for_a_malformed_kline_response() -> None:
 def test_provider_raises_for_an_http_failure() -> None:
     error = HTTPError("https://api.binance.com/api/v3/klines", 503, "Unavailable", None, None)
 
-    with patch("src.data.providers.binance_spot.urlopen", side_effect=error):
-        provider = BinanceSpotMarketDataProvider()
+    sleep = Mock()
+
+    with patch("src.data.providers.binance_spot.urlopen", side_effect=error) as urlopen:
+        provider = BinanceSpotMarketDataProvider(sleep=sleep)
 
         with pytest.raises(BinanceHttpError, match="HTTP 503"):
             provider.get_candles(CandleRequest("BTC/USDT", "1m", limit=1))
+
+    assert urlopen.call_count == 5
+    assert [call.args[0] for call in sleep.call_args_list] == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_provider_retries_transient_failures_with_backoff() -> None:
+    open_time = datetime(2026, 8, 30, 9, 0, tzinfo=UTC)
+    transport = Mock(
+        side_effect=[
+            BinanceHttpError("Binance returned HTTP 429", status=429),
+            OSError("connection reset"),
+            response_for(make_kline(open_time)),
+        ]
+    )
+    sleep = Mock()
+    provider = BinanceSpotMarketDataProvider(transport=transport, sleep=sleep)
+
+    candles = provider.get_candles(CandleRequest("BTC/USDT", "1m", limit=1))
+
+    assert [candle.open_time for candle in candles] == [open_time]
+    assert transport.call_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("status", [400, 418])
+def test_provider_does_not_retry_permanent_http_errors(status: int) -> None:
+    transport = Mock(side_effect=BinanceHttpError(f"Binance returned HTTP {status}", status=status))
+    sleep = Mock()
+    provider = BinanceSpotMarketDataProvider(transport=transport, sleep=sleep)
+
+    with pytest.raises(BinanceHttpError, match=f"HTTP {status}"):
+        provider.get_candles(CandleRequest("BTC/USDT", "1m", limit=1))
+
+    assert transport.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_provider_gives_up_after_max_retries() -> None:
+    transport = Mock(side_effect=BinanceHttpError("Binance returned HTTP 429", status=429))
+    sleep = Mock()
+    provider = BinanceSpotMarketDataProvider(
+        transport=transport, max_retries=2, retry_delay_seconds=0.5, sleep=sleep
+    )
+
+    with pytest.raises(BinanceHttpError, match="HTTP 429"):
+        provider.get_candles(CandleRequest("BTC/USDT", "1m", limit=1))
+
+    assert transport.call_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [0.5, 1.0]
 
 
 def test_provider_paginates_when_the_requested_limit_exceeds_binance_maximum() -> None:
